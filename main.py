@@ -29,6 +29,7 @@ from profiler import (
 from nvidiaApi import NvidiaApi, get_libcudart_path
 from iluvatarApi import IluvatarApi
 from metax_hpccAPI import HpccApi
+from metax_macaAPI import MacaApi
 
 
 # ---------------- CPU Information ----------------
@@ -551,6 +552,7 @@ def detect_platform_by_smi():
         ("NVIDIA", "nvidia-smi"),
         ("Iluvatar", "ixsmi"),
         ("MetaX_Hpcc", "ht-smi"),
+        ("MetaX_Maca", "mc-smi"),
     ]
     for name, cmd in candidates:
         try:
@@ -575,14 +577,18 @@ def create_platform_api():
             return IluvatarApi(), "Iluvatar"
         elif platform == "MetaX_Hpcc":
             return HpccApi(), "MetaX_Hpcc"
+        elif platform == "MetaX_Maca":
+            return MacaApi(), "MetaX_Maca"
     except Exception:
         pass
     # 2. fallback：identify GPU by libcudart path 
     path = get_libcudart_path().lower()
     if "corex" in path or "iluvatar" in path:
         return IluvatarApi(), "Iluvatar"
-    if "metax" in path or "ht" in path:
+    if "hpcc" in path:
         return HpccApi(), "MetaX_Hpcc"
+    if "maca" in path:
+        return MacaApi(), "MetaX_Maca"
     if "cuda" in path:
         return NvidiaApi(), "NVIDIA"
     raise RuntimeError("Unknown GPU platform")

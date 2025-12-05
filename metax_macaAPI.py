@@ -13,21 +13,21 @@ import os
 from infiniAPI import InfiniApi
 
 
-class HpccApi(InfiniApi):
-    """NVIDIA CUDA平台API实现"""
+class MacaApi(InfiniApi):
+    """METAX Maca Platform API Implementation"""
     
     smi = "mx-smi"
     
-    # def __init__(self):
-    #     try:
-    #         self._libcudart = ctypes.CDLL("libcudart.so")
-    #     except OSError:
-    #         raise RuntimeError(
-    #             "Failed to load libcudart.so. "
-    #             "Make sure CUDA is installed and LD_LIBRARY_PATH is set."
-    #         )
+    def __init__(self):
+        try:
+            self._libcudart = ctypes.CDLL("libhcruntime.so")
+        except OSError:
+            raise RuntimeError(
+                "Failed to load libhcruntime.so. "
+                "Make sure Maca is installed and LD_LIBRARY_PATH is set."
+            )
 
-    # ------------ 设备管理 ------------
+    # ------------ Device Management ------------
     def infiniGetDeviceCount(self, count: Any) -> int:
         return self._libcudart.mcGetDeviceCount(count)
 
@@ -42,7 +42,7 @@ class HpccApi(InfiniApi):
         self._libcudart.mcGetErrorString.argtypes = [ctypes.c_int]
         return self._libcudart.mcGetErrorString(error)
 
-    # ------------ P2P能力 ------------
+    # ------------ P2P capability ------------
     def infiniDeviceCanAccessPeer(self, can_access: Any, device: int, peer_device: int) -> int:
         return self._libcudart.mcDeviceCanAccessPeer(can_access, device, peer_device)
 
@@ -52,21 +52,21 @@ class HpccApi(InfiniApi):
     def infiniDeviceDisablePeerAccess(self, peer_device: int) -> int:
         return self._libcudart.mcDeviceDisablePeerAccess(peer_device)
 
-    # ------------ 设备内存管理 ------------
+    # ------------ Device memory management ------------
     def infiniMalloc(self, dev_ptr: Any, size: int) -> int:
         return self._libcudart.mcMalloc(dev_ptr, size)
 
     def infiniFree(self, dev_ptr: Any) -> int:
         return self._libcudart.mcFree(dev_ptr)
 
-    # ------------ 固定页内存 ------------
+    # ------------ Pinned page memory ------------
     def infiniHostAlloc(self, ptr: Any, size: int, flags: int) -> int:
         return self._libcudart.mcMallocHost(ptr, size, flags)
 
     def infiniFreeHost(self, ptr: Any) -> int:
         return self._libcudart.mcFreeHost(ptr)
 
-    # ------------ 流管理 ------------
+    # ------------ Stream management ------------
     def infiniStreamCreate(self, p_stream: Any) -> int:
         return self._libcudart.mcStreamCreate(p_stream)
 
@@ -79,7 +79,7 @@ class HpccApi(InfiniApi):
     def infiniStreamSynchronize(self, stream: Any) -> int:
         return self._libcudart.mcStreamSynchronize(stream)
 
-    # ------------ 内存拷贝 ------------
+    # ------------ Memory copy ------------
     def infiniMemcpyPeerAsync(
         self, dst: Any, dst_device: int, src: Any, src_device: int, count: int, stream: Any
     ) -> int:
@@ -88,7 +88,7 @@ class HpccApi(InfiniApi):
     def infiniMemcpyAsync(self, dst: Any, src: Any, count: int, kind: int, stream: Any) -> int:
         return self._libcudart.mcMemcpyAsync(dst, src, count, kind, stream)
 
-    # ------------ 事件管理 ------------
+    # ------------ Event Management ------------
     def infiniEventCreate(self, event: Any) -> int:
         return self._libcudart.mcEventCreate(event)
 
