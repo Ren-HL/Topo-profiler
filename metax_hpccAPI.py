@@ -10,7 +10,7 @@ from typing import Any
 import ctypes
 import os
 
-from c5__infiniAPI import InfiniApi
+from infiniAPI import InfiniApi
 
 
 class HpccApi(InfiniApi):
