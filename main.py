@@ -30,6 +30,7 @@ from nvidiaApi import NvidiaApi, get_libcudart_path
 from iluvatarApi import IluvatarApi
 from metax_hpccAPI import HpccApi
 from metax_macaAPI import MacaApi
+from musaApi import MusaApi
 
 
 # ---------------- CPU Information ----------------
@@ -552,7 +553,9 @@ def detect_platform_by_smi():
         ("NVIDIA", "nvidia-smi"),
         ("Iluvatar", "ixsmi"),
         ("MetaX_Hpcc", "ht-smi"),
-        ("MetaX_Maca", "mc-smi"),
+        ("MetaX_Maca", "mx-smi"),
+        ("Moore_Musa", "mthreads-gmi")
+
     ]
     for name, cmd in candidates:
         try:
@@ -579,6 +582,8 @@ def create_platform_api():
             return HpccApi(), "MetaX_Hpcc"
         elif platform == "MetaX_Maca":
             return MacaApi(), "MetaX_Maca"
+        elif platform == "Moore_Musa":
+            return MusaApi(), "Moore_Musa"
     except Exception:
         pass
     # 2. fallback：identify GPU by libcudart path 
@@ -591,6 +596,8 @@ def create_platform_api():
         return MacaApi(), "MetaX_Maca"
     if "cuda" in path:
         return NvidiaApi(), "NVIDIA"
+    if "musa" in path:
+        return MusaApi(), "Moore_Musa"
     raise RuntimeError("Unknown GPU platform")
 
 # def create_platform_api():

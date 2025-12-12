@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 The implementation of InfiniApi on the Moore platform
-Load *****.so via ctypes.CDLL
-Bind the infiniXxx function to the ***** function
+Load libmusart.so via ctypes.CDLL
+Bind the infiniXxx function to the libmusart.so function
 """
 
 from __future__ import annotations
@@ -13,18 +13,18 @@ import os
 from infiniAPI import InfiniApi
 
 
-class HpccApi(InfiniApi):
-    """****** Platform API Implementation"""
+class MusaApi(InfiniApi):
+    """Musa Platform API Implementation"""
     
     smi = "mthreads-gmi"
     
     def __init__(self):
         try:
-            self._libcudart = ctypes.CDLL("*****")
+            self._libcudart = ctypes.CDLL("libmusart.so")
         except OSError:
             raise RuntimeError(
-                "Failed to load *****. "
-                "Make sure ***** is installed and LD_LIBRARY_PATH is set."
+                "Failed to load libmusart.so. "
+                "Make sure libmusart.so is installed and LD_LIBRARY_PATH is set."
             )
 
     # ------------ Device Management ------------

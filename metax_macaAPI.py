@@ -20,10 +20,10 @@ class MacaApi(InfiniApi):
     
     def __init__(self):
         try:
-            self._libcudart = ctypes.CDLL("libhcruntime.so")
+            self._libcudart = ctypes.CDLL("libmcruntime.so")
         except OSError:
             raise RuntimeError(
-                "Failed to load libhcruntime.so. "
+                "Failed to load libmcruntime.so. "
                 "Make sure Maca is installed and LD_LIBRARY_PATH is set."
             )
 

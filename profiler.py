@@ -338,7 +338,168 @@ class GpuProfiler:
 
         # Guaranteed to return results sorted by index.
         return [gpu_basic[i] for i in sorted(gpu_basic)]
+    def _parse_mthreads_gmi_for_device_info(self, num_gpus: int, smi: str) -> List[dict[str, Any]]:
+        """
+        Parse `mthreads-gmi --query` output and return metadata dicts whose keys
+        fully match NVIDIA path in this project.
+        """
+        meta: List[dict[str, Any]] = []
+        smi_basename = os.path.basename(smi)
 
+        proc = subprocess.run(
+            [smi, "--query"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode != 0:
+            log_warn("{} --query failed: {}", smi, proc.stderr)
+            return meta
+
+        text = proc.stdout
+        lines = text.splitlines()
+
+        # State per GPU block
+        cur_idx: int | None = None
+        cur: dict[str, Any] | None = None
+
+        # Helper to finalize one GPU entry
+        def _flush():
+            nonlocal cur_idx, cur
+            if cur is None:
+                return
+            meta.append(cur)
+            cur_idx = None
+            cur = None
+
+        # Small helpers
+        def _parse_pci(pci_bus_id: str):
+            # Examples:
+            #   00000000:2a:00.0
+            #   0002:05:00.0
+            try:
+                if pci_bus_id.count(":") == 2:
+                    dom_s, bus_s, rest = pci_bus_id.split(":")
+                else:
+                    # If missing domain, treat as N/A
+                    return ("N/A", "N/A", "N/A")
+                dev_s, _fn = rest.split(".")
+                return (int(dom_s, 16), int(bus_s, 16), int(dev_s, 16))
+            except Exception:
+                return ("N/A", "N/A", "N/A")
+
+        def _int_x(val: str) -> Any:
+            # "16x" -> 16
+            try:
+                return int(val.strip().lower().rstrip("x"))
+            except Exception:
+                return "N/A"
+
+        def _int(val: str) -> Any:
+            try:
+                return int(val.strip())
+            except Exception:
+                return "N/A"
+
+        def _float(val: str) -> float | None:
+            try:
+                return float(val.strip())
+            except Exception:
+                return None
+
+        # Parse line-by-line
+        i = 0
+        while i < len(lines):
+            line = lines[i].rstrip()
+
+            # Start of GPU block:
+            # "GPU0 00000000:2a:00.0"
+            m = re.match(r"^GPU(\d+)\s+([0-9a-fA-F:]+\.[0-9])\s*$", line.strip())
+            if m:
+                _flush()
+                cur_idx = int(m.group(1))
+                pci_bus_id = m.group(2)
+
+                pci_domain, pci_bus, pci_device = _parse_pci(pci_bus_id)
+
+                cur = {
+                    "index": cur_idx,
+                    "name": "N/A",
+                    "pci_bus_id": pci_bus_id,
+                    "pci_domain": pci_domain,
+                    "pci_bus": pci_bus,
+                    "pci_device": pci_device,
+                    "max_pcie_gen": "N/A",
+                    "max_pcie_width": "N/A",
+                    "current_pcie_gen": "N/A",
+                    "current_pcie_width": "N/A",
+                    "total_memory_gb": "N/A",
+                    "compute_capability": "N/A",
+                    "source": smi_basename,
+                }
+                i += 1
+                continue
+
+            if cur is None:
+                i += 1
+                continue
+
+            # Key lines in `mthreads-gmi --query` block
+            # "Product Name : MTT S5000"
+            if "Product Name" in line and ":" in line:
+                cur["name"] = line.split(":", 1)[1].strip()
+                i += 1
+                continue
+
+            # PCIe Generation Max/Current (under GPU Link Info)
+            # "Max : 5" / "Current : 5"
+            if re.search(r"\bPCIe Generation\b", line):
+                # The next few lines contain Max/Current
+                # We just scan forward a small window
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    lj = lines[j].strip()
+                    if lj.startswith("Max") and ":" in lj:
+                        cur["max_pcie_gen"] = _int(lj.split(":", 1)[1])
+                    elif lj.startswith("Current") and ":" in lj:
+                        cur["current_pcie_gen"] = _int(lj.split(":", 1)[1])
+                i += 1
+                continue
+
+            # Link Width Max/Current: "16x"
+            if re.search(r"\bLink Width\b", line) or re.search(r"\bPcie Lane Width\b", line):
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    lj = lines[j].strip()
+                    if lj.startswith("Max") and ":" in lj:
+                        cur["max_pcie_width"] = _int_x(lj.split(":", 1)[1])
+                    elif lj.startswith("Current") and ":" in lj:
+                        cur["current_pcie_width"] = _int_x(lj.split(":", 1)[1])
+                i += 1
+                continue
+
+            # Memory total: under "FB Memory Usage" -> "Total : 81920MiB"
+            if re.search(r"\bFB Memory Usage\b", line):
+                # scan next window
+                for j in range(i + 1, min(i + 20, len(lines))):
+                    lj = lines[j].strip()
+                    if lj.startswith("Total") and ":" in lj:
+                        val = lj.split(":", 1)[1].strip()
+                        # "81920MiB"
+                        m2 = re.match(r"^([0-9.]+)\s*MiB$", val, re.IGNORECASE)
+                        if m2:
+                            mib = _float(m2.group(1))
+                            if mib is not None:
+                                cur["total_memory_gb"] = round(mib / 1024.0, 2)
+                        break
+                i += 1
+                continue
+
+            i += 1
+
+        _flush()
+
+        # Ensure we return in index order and at most num_gpus entries
+        meta.sort(key=lambda d: d.get("index", 0))
+        return meta[:num_gpus]
     def _parse_smi_for_device_info(self, num_gpus: int) -> List[dict[str, Any]]:
         """Parse the SMI command to obtain device information"""
         meta: List[dict[str, Any]] = []
@@ -349,6 +510,9 @@ class GpuProfiler:
         # --- MetaX do not support --query-gpu, need to use this ---#
         if smi_basename in ("ht-smi", "mx-smi"):
             return self._parse_metax_smi_for_device_info(num_gpus, smi)
+        # --- Moore Threads (MUSA): mthreads-gmi --query is not csv, parse text ---#
+        if smi_basename == "mthreads-gmi":
+            return self._parse_mthreads_gmi_for_device_info(num_gpus, smi)
 
         if is_ixsmi:
             query_fields = "name,memory.total,pci.bus_id,pci.domain,pci.bus,pci.device"
