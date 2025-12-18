@@ -29,6 +29,7 @@ from profiler import (
 from nvidiaApi import NvidiaApi, get_libcudart_path
 from iluvatarApi import IluvatarApi
 from metax_hpccAPI import HpccApi
+<<<<<<< HEAD
 from hygonApi import HygonApi
 
 
@@ -68,6 +69,13 @@ def _get_cpu_mhz():
     except Exception:
         return None
 
+=======
+from metax_macaAPI import MacaApi
+from musaApi import MusaApi
+
+
+# ---------------- CPU Information ----------------
+>>>>>>> origin/main
 def get_cpu_info() -> dict[str, Any]:
     cpu_info: dict[str, Any] = {}
     try:
@@ -128,6 +136,7 @@ def get_cpu_info() -> dict[str, Any]:
             elif key == "NUMA node(s)":
                 cpu_info["numa_nodes"] = int(value)
 
+<<<<<<< HEAD
             if (
                 cpu_info.get("base_freq_mhz") is None and
                 cpu_info.get("max_freq_mhz") is None and
@@ -139,6 +148,8 @@ def get_cpu_info() -> dict[str, Any]:
                     cpu_info["max_freq_mhz"] = freq.get("maxmhz")
                     cpu_info["min_freq_mhz"] = freq.get("minmhz")
 
+=======
+>>>>>>> origin/main
     except Exception as e:
         log_warn("Failed to parse CPU information: {}", e)
 
@@ -240,6 +251,7 @@ def write_human_readable_log(
         f.write("### 1. GPU Device & PCIe Information ###\n")
         f.write("(Source: {})\n".format(meta[0]["source"] if meta else "unknown"))
         for m in meta:
+<<<<<<< HEAD
             # print(
             #     "DEBUG:",
             #     "domain =", repr(m["pci_domain"]), type(m["pci_domain"]),
@@ -247,6 +259,8 @@ def write_human_readable_log(
             #     "device =", repr(m["pci_device"]), type(m["pci_device"]),
             # )#因为报错看数据类型
 
+=======
+>>>>>>> origin/main
             f.write(f"\nGPU{m['index']} - {m['name']}:\n")
             if isinstance(m["pci_domain"], int):
                 pci_loc_line = (
@@ -459,6 +473,7 @@ def _merge_topo_header(header_parts):
             merged.append(f"{header_parts[i]} Affinity")
             i += 2
             continue
+<<<<<<< HEAD
         if (#hygon
             i + 1 < n
             and header_parts[i + 1] == "Node"
@@ -467,6 +482,8 @@ def _merge_topo_header(header_parts):
             merged.append(f"{header_parts[i]} Node")
             i += 2
             continue
+=======
+>>>>>>> origin/main
         merged.append(header_parts[i])
         i += 1
     return merged
@@ -613,12 +630,22 @@ def detect_platform_by_smi():
         ("NVIDIA", "nvidia-smi"),
         ("Iluvatar", "ixsmi"),
         ("MetaX_Hpcc", "ht-smi"),
+<<<<<<< HEAD
         ("Hygon", "hy-smi"),
+=======
+        ("MetaX_Maca", "mx-smi"),
+        ("Moore_Musa", "mthreads-gmi")
+
+>>>>>>> origin/main
     ]
     for name, cmd in candidates:
         try:
             proc = subprocess.run(
+<<<<<<< HEAD
                 [cmd, "-h"],         # -L List GPU
+=======
+                [cmd, "-L"],         # -L List GPU
+>>>>>>> origin/main
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -638,18 +665,36 @@ def create_platform_api():
             return IluvatarApi(), "Iluvatar"
         elif platform == "MetaX_Hpcc":
             return HpccApi(), "MetaX_Hpcc"
+<<<<<<< HEAD
         elif platform == "Hygon":
             return HygonApi(), "Hygon"
+=======
+        elif platform == "MetaX_Maca":
+            return MacaApi(), "MetaX_Maca"
+        elif platform == "Moore_Musa":
+            return MusaApi(), "Moore_Musa"
+>>>>>>> origin/main
     except Exception:
         pass
     # 2. fallback：identify GPU by libcudart path 
     path = get_libcudart_path().lower()
     if "corex" in path or "iluvatar" in path:
         return IluvatarApi(), "Iluvatar"
+<<<<<<< HEAD
     if "metax" in path or "ht" in path:
         return HpccApi(), "MetaX_Hpcc"
     if "cuda" in path:
         return NvidiaApi(), "NVIDIA"
+=======
+    if "hpcc" in path:
+        return HpccApi(), "MetaX_Hpcc"
+    if "maca" in path:
+        return MacaApi(), "MetaX_Maca"
+    if "cuda" in path:
+        return NvidiaApi(), "NVIDIA"
+    if "musa" in path:
+        return MusaApi(), "Moore_Musa"
+>>>>>>> origin/main
     raise RuntimeError("Unknown GPU platform")
 
 # def create_platform_api():
