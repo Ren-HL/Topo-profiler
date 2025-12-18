@@ -20,10 +20,10 @@ class HpccApi(InfiniApi):
     
     def __init__(self):
         try:
-            self._libcudart = ctypes.CDLL("libmcruntime.so")
+            self._libcudart = ctypes.CDLL("libhcruntime.so")
         except OSError:
             raise RuntimeError(
-                "Failed to load libmcruntime.so. "
+                "Failed to load libhcruntime.so. "
                 "Make sure HPCC is installed and LD_LIBRARY_PATH is set."
             )
 
