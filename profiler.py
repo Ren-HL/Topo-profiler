@@ -1075,11 +1075,23 @@ class GpuProfiler:
         if event:
             self._check_infini(self.api.infiniEventDestroy(event), "infiniEventDestroy")
 
-    def _with_events(self, stream: Any, repeat: int, fn, *args, **kwargs) -> float:
-        """Measure the average time consumption (in milliseconds) using events"""
+    def _with_events(
+        self,
+        stream: Any,
+        repeat: int,
+        fn,
+        *args,
+        warmup: int = 0,
+        **kwargs,
+    ) -> float:
+        """Measure average time (ms) using events, with optional warm-up."""
         evt_s = self._create_event()
         evt_t = self._create_event()
 
+        self._check_infini(self.api.infiniStreamSynchronize(stream), "infiniStreamSynchronize")
+
+        for _ in range(max(warmup, 0)):
+            fn(*args, **kwargs)
         self._check_infini(self.api.infiniStreamSynchronize(stream), "infiniStreamSynchronize")
 
         self._check_infini(self.api.infiniEventRecord(evt_s, stream), "infiniEventRecord(start)")
@@ -1117,15 +1129,45 @@ class GpuProfiler:
         buffer_bytes: int,
         stream: Any,
         repeat: int = 100,
+        warmup: int = 0,
     ) -> float:
-        """Measuring Unidirectional bandwidth"""
+        """Measure unidirectional bandwidth for a single buffer size."""
         def launch_copy():
             self._peer_memcpy(src_device, dst_device, src_ptr, dst_ptr, buffer_bytes, stream)
 
-        elapsed_ms = self._with_events(stream, repeat, launch_copy)
+        elapsed_ms = self._with_events(stream, repeat, launch_copy, warmup=warmup)
         elapsed_s = elapsed_ms / 1000.0
         bw = (buffer_bytes / (1024.0**3)) / elapsed_s if elapsed_s > 0 else float("inf")
         return bw if src_device != dst_device else bw * 2
+
+    def _measure_peer_bandwidth_max(
+        self,
+        src_device: int,
+        dst_device: int,
+        src_ptr: Any,
+        dst_ptr: Any,
+        buffer_bytes: int,
+        stream: Any,
+        repeat: int,
+        ramp_sizes: list[int] | None,
+        warmup: int,
+    ) -> float:
+        """Measure unidirectional bandwidth with ramp sizes and return max."""
+        if not ramp_sizes:
+            return self._measure_peer_bandwidth(
+                src_device, dst_device, src_ptr, dst_ptr, buffer_bytes, stream, repeat, warmup
+            )
+
+        max_bw = 0.0
+        for sz in ramp_sizes:
+            if sz <= 0 or sz > buffer_bytes:
+                continue
+            bw = self._measure_peer_bandwidth(
+                src_device, dst_device, src_ptr, dst_ptr, sz, stream, repeat, warmup
+            )
+            if bw > max_bw:
+                max_bw = bw
+        return max_bw
 
 
     def _measure_peer_bandwidth_bidi(
@@ -1138,8 +1180,9 @@ class GpuProfiler:
         streamA: Any,
         streamB: Any,
         repeat: int = 100,
+        warmup: int = 0,
     ) -> float:
-        """Measure bidirectional P2P bandwidth (safe version)"""
+        """Measure bidirectional P2P bandwidth (safe version)."""
 
         # Allocate destination buffers
         dstB = self._malloc(devB, buffer_bytes)
@@ -1157,6 +1200,25 @@ class GpuProfiler:
         evt_doneB = self._create_event()
 
         results = []
+
+        for _ in range(max(warmup, 0)):
+            # --- synchronize start gate ---
+            self._check_infini(self.api.infiniSetDevice(devA))
+            self._check_infini(self.api.infiniEventRecord(evt_go_A, streamA))
+            self._check_infini(self.api.infiniStreamWaitEvent(streamA, evt_go_A, 0))
+
+            self._check_infini(self.api.infiniSetDevice(devB))
+            self._check_infini(self.api.infiniEventRecord(evt_go_B, streamB))
+            self._check_infini(self.api.infiniStreamWaitEvent(streamB, evt_go_B, 0))
+
+            # --- launch async transfers ---
+            self._peer_memcpy(devA, devB, ptrA, dstB, buffer_bytes, streamB)
+            self._peer_memcpy(devB, devA, ptrB, dstA, buffer_bytes, streamA)
+
+            self._check_infini(self.api.infiniSetDevice(devA))
+            self._check_infini(self.api.infiniStreamSynchronize(streamA))
+            self._check_infini(self.api.infiniSetDevice(devB))
+            self._check_infini(self.api.infiniStreamSynchronize(streamB))
 
         for _ in range(repeat):
 
@@ -1237,6 +1299,7 @@ class GpuProfiler:
         dst_ptr: Any,
         stream: Any,
         repeat: int = 100,
+        warmup: int = 0,
     ) -> float:
         """Measurement delay (microseconds)"""
         LAT_BYTES = 16
@@ -1244,7 +1307,7 @@ class GpuProfiler:
         def launch_copy():
             self._peer_memcpy(src_device, dst_device, src_ptr, dst_ptr, LAT_BYTES, stream)
 
-        elapsed_ms = self._with_events(stream, repeat, launch_copy)
+        elapsed_ms = self._with_events(stream, repeat, launch_copy, warmup=warmup)
         return elapsed_ms * 1000.0  # ms -> us
 
     def measure_gpu_to_gpu(
@@ -1255,6 +1318,8 @@ class GpuProfiler:
         skip_self: bool,
         description: str,
         repeat: int,
+        ramp_sizes: list[int] | None = None,
+        warmup: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]:
         """
         Measure the bandwidth and latency between Gpus
@@ -1288,23 +1353,45 @@ class GpuProfiler:
                 dst = self._malloc(j, buffer_bytes)
                 stream_j = streams[j]
 
-                lat_uni_read[i, j] = self._measure_peer_latency(i, j, src_ptrs[i], dst, stream_j)
+                lat_uni_read[i, j] = self._measure_peer_latency(
+                    i, j, src_ptrs[i], dst, stream_j, warmup=warmup
+                )
                 log_debug("{} p2p read {}->{} latency: {:.2f} us", description, i, j, lat_uni_read[i, j])
 
-                lat_uni_write[i, j] = self._measure_peer_latency(j, i, dst, src_ptrs[i], stream_j)
+                lat_uni_write[i, j] = self._measure_peer_latency(
+                    j, i, dst, src_ptrs[i], stream_j, warmup=warmup
+                )
                 log_debug("{} p2p write {}->{} latency: {:.2f} us", description, i, j, lat_uni_write[i, j])
 
-                bw_uni_read[i, j] = self._measure_peer_bandwidth(i, j, src_ptrs[i], dst, buffer_bytes, stream_j, repeat)
+                bw_uni_read[i, j] = self._measure_peer_bandwidth_max(
+                    i, j, src_ptrs[i], dst, buffer_bytes, stream_j, repeat, ramp_sizes, warmup
+                )
                 log_debug("{} {}->{} unidirectional bandwidth (read) mean: {:.2f} GB/s",
                         description, i, j, bw_uni_read[i, j])
 
-                bw_uni_write[i, j] = self._measure_peer_bandwidth(j, i, dst, src_ptrs[i], buffer_bytes, stream_j, repeat)
+                bw_uni_write[i, j] = self._measure_peer_bandwidth_max(
+                    j, i, dst, src_ptrs[i], buffer_bytes, stream_j, repeat, ramp_sizes, warmup
+                )
                 log_debug("{} {}->{} unidirectional bandwidth (write) mean: {:.2f} GB/s",
                         description, i, j, bw_uni_write[i, j])
 
                 if bidirectional and bw_bi is not None:
                    stream_i = streams[i]
-                   bw_bi[i, j] = self._measure_peer_bandwidth_bidi(i, j, src_ptrs[i], src_ptrs[j], buffer_bytes, stream_i, stream_j, repeat)
+                   if ramp_sizes:
+                       max_bw = 0.0
+                       for sz in ramp_sizes:
+                           if sz <= 0 or sz > buffer_bytes:
+                               continue
+                           bw = self._measure_peer_bandwidth_bidi(
+                               i, j, src_ptrs[i], src_ptrs[j], sz, stream_i, stream_j, repeat, warmup
+                           )
+                           if bw > max_bw:
+                               max_bw = bw
+                       bw_bi[i, j] = max_bw
+                   else:
+                       bw_bi[i, j] = self._measure_peer_bandwidth_bidi(
+                           i, j, src_ptrs[i], src_ptrs[j], buffer_bytes, stream_i, stream_j, repeat, warmup
+                       )
                    log_debug("{} {}<->{} bidirectional bandwidth mean: {:.2f} GB/s",
                             description, i, j, bw_bi[i, j])
 
@@ -1328,16 +1415,46 @@ class GpuProfiler:
         stream: Any,
         direction: int,
         repeat: int = 100,
+        warmup: int = 0,
     ) -> float:
-        """Measure the Host-GPU bandwidth"""
+        """Measure the Host-GPU bandwidth for a single buffer size."""
         def launch_copy():
             self.api.infiniMemcpyAsync(dev_ptr if direction == cudaMemcpyHostToDevice else host_ptr,
                                         host_ptr if direction == cudaMemcpyHostToDevice else dev_ptr,
                                         buffer_bytes, direction, stream)
 
-        elapsed_ms = self._with_events(stream, repeat, launch_copy)
+        elapsed_ms = self._with_events(stream, repeat, launch_copy, warmup=warmup)
         elapsed_s = elapsed_ms / 1000.0
         return (buffer_bytes / (1024.0**3)) / elapsed_s if elapsed_s > 0 else float("inf")
+
+    def _measure_host_bandwidth_max(
+        self,
+        device: int,
+        dev_ptr: Any,
+        host_ptr: Any,
+        buffer_bytes: int,
+        stream: Any,
+        direction: int,
+        repeat: int,
+        ramp_sizes: list[int] | None,
+        warmup: int,
+    ) -> float:
+        """Measure Host-GPU bandwidth with ramp sizes and return max."""
+        if not ramp_sizes:
+            return self._measure_host_bandwidth(
+                device, dev_ptr, host_ptr, buffer_bytes, stream, direction, repeat, warmup
+            )
+
+        max_bw = 0.0
+        for sz in ramp_sizes:
+            if sz <= 0 or sz > buffer_bytes:
+                continue
+            bw = self._measure_host_bandwidth(
+                device, dev_ptr, host_ptr, sz, stream, direction, repeat, warmup
+            )
+            if bw > max_bw:
+                max_bw = bw
+        return max_bw
 
     def measure_gpu_to_host(
         self,
@@ -1346,6 +1463,8 @@ class GpuProfiler:
         fallback_bytes: int,
         repeat: int,
         latency_iters: int = 10,
+        ramp_sizes: list[int] | None = None,
+        warmup: int = 0,
     ):
         """
         Measure the Host-GPU bandwidth：
@@ -1384,7 +1503,7 @@ class GpuProfiler:
                     direction,
                     stream,
                 )
-            avg_ms = self._with_events(stream, latency_iters, _copy)
+            avg_ms = self._with_events(stream, latency_iters, _copy, warmup=warmup)
             self._destroy_stream(stream)
             return avg_ms * 1000.0  # ms→us
 
@@ -1398,11 +1517,11 @@ class GpuProfiler:
             host_ptr = ctypes.cast(host_buf, ctypes.c_void_p)
 
             # Use Python's create_string_buffer
-            pageable_h2d[i] = self._measure_host_bandwidth(
-                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyHostToDevice, repeat
+            pageable_h2d[i] = self._measure_host_bandwidth_max(
+                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyHostToDevice, repeat, ramp_sizes, warmup
             )
-            pageable_d2h[i] = self._measure_host_bandwidth(
-                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyDeviceToHost, repeat
+            pageable_d2h[i] = self._measure_host_bandwidth_max(
+                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyDeviceToHost, repeat, ramp_sizes, warmup
             )
 
             # Delay measurement
@@ -1421,11 +1540,11 @@ class GpuProfiler:
             host_ptr = self._alloc_host(used_bytes)  # pinned host
 
             # Bandwidth measurement
-            pinned_h2d[i] = self._measure_host_bandwidth(
-                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyHostToDevice, repeat
+            pinned_h2d[i] = self._measure_host_bandwidth_max(
+                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyHostToDevice, repeat, ramp_sizes, warmup
             )
-            pinned_d2h[i] = self._measure_host_bandwidth(
-                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyDeviceToHost, repeat
+            pinned_d2h[i] = self._measure_host_bandwidth_max(
+                i, dev_ptr, host_ptr, used_bytes, stream, cudaMemcpyDeviceToHost, repeat, ramp_sizes, warmup
             )
 
             # Delay measurement

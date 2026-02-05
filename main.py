@@ -177,6 +177,7 @@ def write_human_readable_log(
     p2p_capable,
     topo_str,
     args,
+    ramp_sizes_mib,
     bw_gpu_uni_disabled_read,
     bw_gpu_uni_disabled_write,
     bw_gpu_bi_disabled,
@@ -206,7 +207,12 @@ def write_human_readable_log(
         f.write(
             f"Buffer Size: {args.buffer} MiB (fallback: {args.fallback_buffer} MiB)\n"
         )
+        if ramp_sizes_mib:
+            f.write(
+                f"Bandwidth Ramp Sizes (MiB): {', '.join(str(x) for x in ramp_sizes_mib)}\n"
+            )
         f.write(f"Repetitions: {args.repeat} (mean values reported)\n")
+        f.write(f"Warm-up: {args.warmup} iterations\n")
 
         total_cores = cpu_info.get("total_cores", "N/A")
         sockets = cpu_info.get("sockets", "N/A")
@@ -506,6 +512,7 @@ def save_json_all(
     p2p_capable,
     topo_str,
     args,
+    ramp_sizes_mib,
     bw_gpu_uni_disabled_read,
     bw_gpu_uni_disabled_write,
     bw_gpu_bi_disabled,
@@ -532,6 +539,8 @@ def save_json_all(
             "platform": platform,
             "buffer_mib": args.buffer,
             "fallback_buffer_mib": args.fallback_buffer,
+            "bandwidth_ramp_sizes_mib": ramp_sizes_mib or [],
+            "warmup": args.warmup,
             "repeat": args.repeat,
             "bidirectional_enabled": bool(args.bidirectional),
             "include_self_gpu_pairs": bool(args.include_self),
@@ -751,6 +760,23 @@ def main() -> int:
         default=3,
         help="Number of measurement repetitions (default: 3)",
     )
+    parser.add_argument(
+        "--ramp",
+        action="store_true",
+        help="Use ramped buffer sizes and report max bandwidth",
+    )
+    parser.add_argument(
+        "--ramp-min",
+        type=int,
+        default=1,
+        help="Minimum ramp buffer size in MiB (default: 1)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+        help="Warm-up iterations before timing (default: 5)",
+    )
 
     args = parser.parse_args()
     set_log_level(args.log_level)
@@ -779,14 +805,33 @@ def main() -> int:
 
         p2p_capable = profiler.get_p2p_capability_matrix(num_gpus)
 
+        def _build_ramp_sizes_mib(max_mib: int, min_mib: int) -> list[int]:
+            if max_mib <= 0:
+                return []
+            m = max(1, min_mib)
+            sizes = []
+            while m < max_mib:
+                sizes.append(m)
+                m *= 2
+            sizes.append(max_mib)
+            return sorted(set(sizes))
+
+        ramp_sizes_mib = (
+            _build_ramp_sizes_mib(args.buffer, args.ramp_min) if args.ramp else []
+        )
+        ramp_sizes_bytes = [m * 1024 * 1024 for m in ramp_sizes_mib] if ramp_sizes_mib else None
+
         buffer_bytes = args.buffer * 1024 * 1024
         fallback_bytes = args.fallback_buffer * 1024 * 1024
         log_info(
-            "Using buffer size: {} MiB (fallback: {} MiB), {} repetitions",
+            "Using buffer size: {} MiB (fallback: {} MiB), {} repetitions, warmup={}",
             args.buffer,
             args.fallback_buffer,
             args.repeat,
+            args.warmup,
         )
+        if ramp_sizes_mib:
+            log_info("Bandwidth ramp sizes (MiB): {}", ramp_sizes_mib)
 
         # 1) P2P disabled
         log_info("\n=== P2P DISABLED measurements ===")
@@ -804,6 +849,8 @@ def main() -> int:
             skip_self=(not args.include_self),
             description="P2P disabled",
             repeat=args.repeat,
+            ramp_sizes=ramp_sizes_bytes,
+            warmup=args.warmup,
         )
 
         # 2) P2P enabled
@@ -823,6 +870,8 @@ def main() -> int:
             skip_self=(not args.include_self),
             description="P2P enabled",
             repeat=args.repeat,
+            ramp_sizes=ramp_sizes_bytes,
+            warmup=args.warmup,
         )
         profiler.disable_peer_access(num_gpus)
 
@@ -842,6 +891,8 @@ def main() -> int:
             buffer_bytes=buffer_bytes,
             fallback_bytes=fallback_bytes,
             repeat=args.repeat,
+            ramp_sizes=ramp_sizes_bytes,
+            warmup=args.warmup,
         )
 
         out_prefix = Path(args.output)
@@ -858,6 +909,7 @@ def main() -> int:
                 p2p_capable=p2p_capable,
                 topo_str=topo_str,
                 args=args,
+                ramp_sizes_mib=ramp_sizes_mib,
                 bw_gpu_uni_disabled_read=bw_gpu_uni_disabled_read,
                 bw_gpu_uni_disabled_write=bw_gpu_uni_disabled_write,
                 bw_gpu_bi_disabled=bw_gpu_bi_disabled,
@@ -989,6 +1041,7 @@ def main() -> int:
                 p2p_capable,
                 topo_str,
                 args,
+                ramp_sizes_mib,
                 bw_gpu_uni_disabled_read,
                 bw_gpu_uni_disabled_write,
                 bw_gpu_bi_disabled,
