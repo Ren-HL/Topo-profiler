@@ -13,6 +13,8 @@ import subprocess
 import re
 import os
 import sys
+import csv
+from io import StringIO
 
 import numpy as np
 
@@ -169,7 +171,8 @@ class GpuProfiler:
         return p2p_capable
 
     # -------------------- Topological information --------------------
-    def _get_hygon_native_topology_str1(self) -> str:#dtk23.04
+
+    def _get_hygon_native_topology_str(self) -> str:#Revised Version
         """Obtain Hygon native topology information (using --showtopo)"""
         smi = self.api.smi or "hy-smi"
         proc = subprocess.run(
@@ -184,117 +187,81 @@ class GpuProfiler:
         raw = proc.stdout
         raw2 = raw.replace("\t", "    ")
         lines = raw2.splitlines()
-        header = None
         link_block: list[str] = []
         numa_block: list[str] = []
-        numa_node: list[str] = []
-        numa_affinity: list[str] = []
 
-        # ------- Extract the "Link Type between DCUs" table -------
+        # Automatic detection device prefix (DCU or HCU)
+        device_prefix = None
+        for ln in lines:
+            stripped = _strip_ansi(ln).strip()
+            if "Link Type between" in stripped:
+                if "DCUs" in stripped:
+                    device_prefix = "DCU"
+                elif "HCUs" in stripped:
+                    device_prefix = "HCU"
+                break
+        
+        if not device_prefix:
+            # No detection was made. Attempting to infer from the NUMA information.
+            for ln in lines:
+                stripped = _strip_ansi(ln).strip()
+                if stripped.startswith("DCU["):
+                    device_prefix = "DCU"
+                    break
+                elif stripped.startswith("HCU["):
+                    device_prefix = "HCU"
+                    break
+        
+        if not device_prefix:
+            # Nothing was found. Return to the original output.
+            return raw2
+
+        # Extract the Link Type table
         in_link = False
+        link_pattern = f"Link Type between {device_prefix}s"
+        
         for ln in lines:
             ln2 = _strip_ansi(ln).rstrip("\n")
             stripped = ln2.strip()
 
-            if not in_link and "Link Type between DCUs" in stripped:
+            if not in_link and link_pattern in stripped:
                 in_link = True
-                #link_block.append(ln2)#Remove the header and add "Numa Node" and "Numa Affinity"
                 continue
 
             if in_link:
-                # The Link Type area ends at the next ==== separator line
                 if re.match(r"^=+$", stripped):
                     in_link = False
                     continue
-                # Skipping all blank lines can be retained as needed. Here, the original format is simply kept
-                if ("DCU[0]" in ln2) and ("DCU[1]" in ln2):
-                    header = ln2
                 link_block.append(ln2)
 
-        # ------- Extract Numa Node / Numa Affinity -------
+        # Extract NUMA information (compatible with two formats)
         for ln in lines:
             ln2 = _strip_ansi(ln).rstrip("\n")
             stripped = ln2.strip()
-            # In the form of:
-            # DCU[0]        : Numa Node:  3
-            # DCU[0]        : Numa Affinity:  3
-            # if stripped.startswith("DCU[") and (
-            #     "Numa Node" in stripped or "Numa Affinity" in stripped
-            # ):
-            #     numa_block.append(ln2)
-            if stripped.startswith("DCU[") and ("Numa Node" in stripped):
-                parts = [pd.strip() for pd in ln2.split(":")]
-                numa_node.append(parts[2])
-            if stripped.startswith("DCU[") and ("Numa Affinity" in stripped):
-                parts = [pd.strip() for pd in ln2.split(":")]
-                numa_affinity.append(parts[2])
-
-        # If the parsing fails, return to the original output (only TAB replacement was performed).
-        # if not link_block and not numa_block:
-        #     return raw2
-        if not link_block and not numa_node and not numa_affinity:
-            return raw2
-
-        # Just concatenate the Link Type table + one blank line + NUMA information
-        out_lines: list[str] = []
-        if link_block:
-            out_lines.extend(link_block)
-        if numa_block:
-            if link_block:
-                out_lines.append("")  # Leave a blank line between the table and NUMA
-            out_lines.extend(numa_block)
-
-        return "\n".join(out_lines)
-
-    def _get_hygon_native_topology_str(self) -> str:
-        """Obtain Hygon native topology information (using --showtopo)"""
-        smi = self.api.smi or "hy-smi"
-        proc = subprocess.run(
-            [smi, "--showtopo"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"{smi} --showtopo failed: {proc.stderr}")
-        
-        raw = proc.stdout
-        raw2 = raw.replace("\t", "    ")
-        lines = raw2.splitlines()
-        link_block: list[str] = []
-        numa_block: list[str] = []
-
-        in_link = False #"Link Type between DCUs" table
-        for ln in lines:
-            ln2 = _strip_ansi(ln).rstrip("\n")
-            stripped = ln2.strip()
-
-            if not in_link and "Link Type between DCUs" in stripped:#Link Type zone
-                in_link = True
-                continue
-
-            if in_link:
-                if re.match(r"^=+$", stripped):#end at the divider line
-                    in_link = False
-                    continue
-                link_block.append(ln2)
-
-        for ln in lines:
-            ln2 = _strip_ansi(ln).rstrip("\n")
-            stripped = ln2.strip()
-            if stripped.startswith("DCU[") and (
+            if stripped.startswith(f"{device_prefix}[") and (
                 "Numa Node" in stripped or "Numa Affinity" in stripped
             ):
                 numa_block.append(ln2)
 
-        if not link_block and not numa_block:#Not found. Return to the original output
+        if not link_block and not numa_block:
             return raw2
 
-        numa_map: dict[int, dict[str, str]] = {}#Map to a dictionary{node, affinity}
+        # Parse NUMA information (compatible with two formats)
+        numa_map: dict[int, dict[str, str]] = {}
         for ln in numa_block:
             s = _strip_ansi(ln).strip()
-            m_node = re.match(r"DCU\[(\d+)\].*Numa Node:\s*(\S+)", s)
-            m_aff  = re.match(r"DCU\[(\d+)\].*Numa Affinity:\s*(\S+)", s)
+            
+            # Server A format: DCU[0] : Numa Node: 3
+            # Server B format: HCU[0] : (Topology) Numa Node 0
+            m_node = re.match(
+                rf"{device_prefix}\[(\d+)\].*Numa Node[:\s]+(\S+)",
+                s
+            )
+            m_aff = re.match(
+                rf"{device_prefix}\[(\d+)\].*Numa Affinity[:\s]+(\S+)",
+                s
+            )
+            
             if m_node:
                 idx = int(m_node.group(1))
                 val = m_node.group(2)
@@ -304,14 +271,15 @@ class GpuProfiler:
                 val = m_aff.group(2)
                 numa_map.setdefault(idx, {})["affinity"] = val
 
-        node_header = "NUMA Node"#Calculate the width of the new column
+        # Calculate the width of the new column
+        node_header = "NUMA Node"
         aff_header  = "NUMA Affinity"
         node_vals = [info.get("node", "N/A") for info in numa_map.values()]
         aff_vals  = [info.get("affinity", "N/A") for info in numa_map.values()]
         node_w = max(len(node_header), max((len(str(v)) for v in node_vals), default=0))
         aff_w  = max(len(aff_header),  max((len(str(v)) for v in aff_vals),  default=0))
 
-        # The longest row in the table determines the starting position on the right side
+        # Merge information
         base_width = max(len(_strip_ansi(l)) for l in link_block) if link_block else 0
         out_lines: list[str] = []
         header_added = False
@@ -321,26 +289,29 @@ class GpuProfiler:
             stripped = bare.strip()
             padded = bare.ljust(base_width)
 
-            if (not header_added) and ("DCU[0]" in stripped):#Header row: No title has been added yet
+            # Check the header (including DCU[0] or HCU[0])
+            if (not header_added) and (f"{device_prefix}[0]" in stripped):
                 header_added = True
-                hdr = padded + "" + f"{node_header:<{node_w}}  {aff_header:<{aff_w}}"
+                hdr = padded + "  " + f"{node_header:<{node_w}}  {aff_header:<{aff_w}}"
                 out_lines.append(hdr)
                 continue
 
-            if stripped.startswith("DCU["):#Data rows:
-                m = re.match(r"DCU\[(\d+)\]", stripped)
+            # Data row for testing
+            if stripped.startswith(f"{device_prefix}["):
+                m = re.match(rf"{device_prefix}\[(\d+)\]", stripped)
                 if m:
                     idx = int(m.group(1))
                     info = numa_map.get(idx, {})
                     node = str(info.get("node", "N/A"))
                     aff  = str(info.get("affinity", "N/A"))
-                    row = padded + "" + f"{node:<{node_w}}  {aff:<{aff_w}}"
+                    row = padded + "  " + f"{node:<{node_w}}  {aff:<{aff_w}}"
                     out_lines.append(row)
                     continue
+            
             out_lines.append(bare)
 
         return "\n".join(out_lines)
-        
+
     def get_native_topology_str(self) -> str:
         """Obtain native topology information (using smi topo-m)"""
         smi = self.api.smi or "nvidia-smi"
@@ -513,68 +484,10 @@ class GpuProfiler:
                 cur_idx = None
 
         # Guaranteed to return results sorted by index.
+        for d in gpu_basic.values():
+            self._supplement_pcie_fields_from_lspci(d)
         return [gpu_basic[i] for i in sorted(gpu_basic)]
     
-    def _parse_hygon1_smi_for_device_info(self, num_gpus: int, smi: str):#dkt23.04
-        meta = []
-        smi = self.api.smi or "rocm-smi"
-        #query_fields = "--showproductname --showbus"#Compare with the original name and pci.bus_id
-
-        try:
-            proc = subprocess.run(
-                [smi, "--showproductname", "--showbus","--csv"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if proc.returncode != 0:
-                log_warn("{} query failed: {}", smi, proc.stderr)
-                return meta
-
-            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-            data_lines = lines[1:]#Remove the header of the first row
-            for i in range(min(num_gpus, len(data_lines))):
-                parts = [p.strip() for p in data_lines[i].split(",")]
-                #pcie_data = [pd.strip() for pd in parts[2].split(":")]
-                domain, bus, devfunc = [pd.strip() for pd in parts[2].split(":")]
-                dev, func = devfunc.split(".")
-                # if len(parts) < expected_min_parts:
-                #     continue
-            
-                name = parts[3]
-                total_mem = 0.0 #total_mem = "N/A"
-                pci_bus_id = parts[2]
-                try:
-                    pci_domain = int(domain, 16)
-                    pci_bus = int(bus, 16)
-                    pci_device = int(dev, 16)    
-                except:
-                    pci_domain = pci_bus = pci_device = None
-
-                pcie_gen = "N/A"
-                pcie_width = "N/A"
-                pcie_current_gen = "N/A"
-                pcie_current_width = "N/A"
-
-                meta.append({
-                    "index": i,
-                    "name": name,
-                    "pci_bus_id": pci_bus_id,
-                    "pci_domain": pci_domain,
-                    "pci_bus": pci_bus,
-                    "pci_device": pci_device,
-                    "max_pcie_gen": pcie_gen,
-                    "max_pcie_width": pcie_width,
-                    "current_pcie_gen": pcie_current_gen,
-                    "current_pcie_width": pcie_current_width,
-                    "total_memory_gb": round(total_mem, 2),
-                    "compute_capability": "N/A",
-                    "source": "hy-smi",
-                })
-        except Exception as e:
-            log_warn("Device info parsing failed: {}", e)
-        
-        return meta
 
     def get_pcie_gen(self, speed) -> str:
         """
@@ -660,85 +573,235 @@ class GpuProfiler:
             "cur_width": cur_width,
         }
 
-    def _parse_hygon_smi_for_device_info(self, num_gpus: int, smi: str):#dkt25.04
-        meta = []
-        smi = self.api.smi or "rocm-smi"
+    def _supplement_pcie_fields_from_lspci(self, meta: Dict[str, Any]) -> None:
+        """
+        Shared PCIe supplement for MetaX / Hygon / Moore.
+
+        It fills/overrides the following fields in the project-wide schema:
+        - max_pcie_gen / max_pcie_width
+        - current_pcie_gen / current_pcie_width
+
+        It never raises; on failure it leaves existing values unchanged.
+        """
+        pci_bus_id = meta.get("pci_bus_id")
+        if not isinstance(pci_bus_id, str) or pci_bus_id in ("", "N/A"):
+            return
 
         try:
+            pcie = self._query_pcie_link_info_from_lspci(pci_bus_id)
+            max_speed = pcie.get("max_speed")
+            max_width = pcie.get("max_width")
+            cur_speed = pcie.get("cur_speed")
+            cur_width = pcie.get("cur_width")
+        except Exception as e:
+            log_warn("Device PCIe info parsing failed: {}", e)
+            return
+
+        # Only override if lspci provides meaningful values
+        if max_speed:
+            meta["max_pcie_gen"] = self.get_pcie_gen(max_speed)
+        if max_width:
+            meta["max_pcie_width"] = max_width
+        if cur_speed:
+            meta["current_pcie_gen"] = self.get_pcie_gen(cur_speed)
+        if cur_width:
+            meta["current_pcie_width"] = cur_width
+
+    def _query_pcie_link_info_from_sysfs(self, pci_bus_id: str) -> dict:
+        """
+        Query PCIe link information from sysfs.
+
+        Return dict:
+            {
+                "max_speed": str | None,
+                "max_width": str | None,
+                "cur_speed": str | None,
+                "cur_width": str | None,
+            }
+        """
+        base = f"/sys/bus/pci/devices/{pci_bus_id}"
+
+        def _read(path):
+            try:
+                with open(path, "r") as f:
+                    return f.read().strip()
+            except Exception:
+                return None
+
+        info = {
+            "cur_speed": _read(f"{base}/current_link_speed"),
+            "cur_width": _read(f"{base}/current_link_width"),
+            "max_speed": _read(f"{base}/max_link_speed"),
+            "max_width": _read(f"{base}/max_link_width"),
+        }
+
+        return info
+
+    def _parse_hygon_smi_for_device_info(self, num_gpus: int, smi: str):
+        """
+        Parse hy-smi output (compatible with HY-SMI 1.4.x / 1.6.x),
+        auto-fallback for unsupported options and fix broken CSV.
+        """
+
+        meta = []
+        smi = self.api.smi or "hy-smi"
+
+        # -------- 1. Try high-version command first --------
+        cmd_candidates = [
+            [smi, "--showproductname", "--showbus", "--showmemavailable", "--csv"],  # HY-SMI >= 1.6
+            [smi, "--showproductname", "--showbus", "--csv"],                         # HY-SMI 1.4.x
+        ]
+
+        proc = None
+        for cmd in cmd_candidates:
             proc = subprocess.run(
-                [smi, "--showproductname", "--showbus", "--showmemavailable", "--csv"],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            if proc.returncode != 0:
-                log_warn("{} query failed: {}", smi, proc.stderr)
-                return meta
+            if proc.returncode == 0 and proc.stdout.strip():
+                break
+        else:
+            log_warn("{} query failed: {}", smi, proc.stderr if proc else "unknown error")
+            return meta
 
-            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-            data_lines = lines[1:]#Remove the header of the first row
-            for i in range(min(num_gpus, len(data_lines))):
-                parts = [p.strip() for p in data_lines[i].split(",")]
-                #pcie_data = [pd.strip() for pd in parts[2].split(":")]
-                domain, bus, devfunc = [pd.strip() for pd in parts[4].split(":")]
-                dev, func = devfunc.split(".")
-            
-                name = parts[2]
-                total_mem = float(parts[5]) / 1024.0 #total_mem = "N/A"
-                pci_bus_id = parts[4]
+        lines = proc.stdout.strip().splitlines()
+        if not lines:
+            return meta
+
+        # -------- 2. Fix broken CSV (vendor contains comma) --------
+        header = lines[0]
+        header_parts = header.split(",")
+        expected_fields = len(header_parts)
+        has_time_column = "time" in header.lower()
+
+        fixed_lines = [header]
+
+        for idx, line in enumerate(lines[1:], start=1):
+            parts = line.split(",")
+
+            if len(parts) == expected_fields:
+                fixed_lines.append(line)
+                continue
+
+            # Vendor contains comma → one extra column
+            if len(parts) == expected_fields + 1:
+                if has_time_column:
+                    # time, device, series, vendor1, vendor2, pci, mem?
+                    time_val = parts[0]
+                    device = parts[1]
+                    series = parts[2]
+                    vendor = f'"{parts[3]},{parts[4]}"'
+                    rest = parts[5:]
+                    fixed_lines.append(",".join([time_val, device, series, vendor] + rest))
+                else:
+                    # device, series, vendor1, vendor2, pci, mem?
+                    device = parts[0]
+                    series = parts[1]
+                    vendor = f'"{parts[2]},{parts[3]}"'
+                    rest = parts[4:]
+                    fixed_lines.append(",".join([device, series, vendor] + rest))
+                continue
+
+            log_warn("Unexpected CSV format at line {}: {}", idx, line)
+            fixed_lines.append(line)
+
+        fixed_csv = "\n".join(fixed_lines)
+        reader = csv.DictReader(StringIO(fixed_csv))
+
+        # -------- 3. Header-driven field access (machine-independent) --------
+        FIELD_ALIASES = {
+            "series": ["Card Series", "Card series"],
+            "vendor": ["Card Vendor", "Card vendor"],
+            "pci": ["PCI Bus"],
+            "mem": ["Available memory size (MiB)"],
+        }
+
+        def pick(row, keys, default=None):
+            for k in keys:
+                if k in row and row[k]:
+                    return row[k].strip()
+            return default
+
+        # -------- 4. Build meta --------
+        for i, row in enumerate(reader):
+            if i >= num_gpus:
+                break
+
+            card_series = pick(row, FIELD_ALIASES["series"], "N/A")
+            card_vendor = pick(row, FIELD_ALIASES["vendor"], "N/A")
+            pci_bus_raw = pick(row, FIELD_ALIASES["pci"], None)
+            mem_mib = pick(row, FIELD_ALIASES["mem"], None)
+
+            pci_bus_id = pci_bus_raw.split("-->")[0].strip() if pci_bus_raw else None
+
+            pci_domain = pci_bus = pci_device = None
+            if pci_bus_id:
                 try:
+                    domain, bus, devfunc = pci_bus_id.split(":")
+                    dev, _ = devfunc.split(".")
                     pci_domain = int(domain, 16)
                     pci_bus = int(bus, 16)
-                    pci_device = int(dev, 16)    
-                except:
-                    pci_domain = pci_bus = pci_device = None
-
-                pcie_gen = "N/A"
-                pcie_width = "N/A"
-                pcie_current_gen = "N/A"
-                pcie_current_width = "N/A"
-
-                try:
-                    pcie = self._query_pcie_link_info_from_lspci(pci_bus_id)
-                    max_speed = pcie["max_speed"]
-                    max_width = pcie["max_width"]
-                    cur_speed = pcie["cur_speed"]
-                    cur_width = pcie["cur_width"]
+                    pci_device = int(dev, 16)
                 except Exception as e:
-                    log_warn("Device PCIe info parsing failed: {}", e)
-                    max_speed = max_width = cur_speed = cur_width = None
+                    log_warn("PCI parsing failed for '{}': {}", pci_bus_id, e)
 
-                pcie_gen = self.get_pcie_gen(max_speed) if max_speed else "N/A"
-                pcie_width = max_width if max_width else "N/A"
-                pcie_current_gen = self.get_pcie_gen(cur_speed) if cur_speed else "N/A"
-                pcie_current_width = cur_width if cur_width else "N/A"
+            try:
+                total_mem = float(mem_mib) / 1024.0 if mem_mib else 0.0
+            except Exception:
+                total_mem = 0.0
 
-                meta.append({
-                    "index": i,
-                    "name": name,
-                    "pci_bus_id": pci_bus_id,
-                    "pci_domain": pci_domain,
-                    "pci_bus": pci_bus,
-                    "pci_device": pci_device,
-                    "max_pcie_gen": pcie_gen,
-                    "max_pcie_width": pcie_width,
-                    "current_pcie_gen": pcie_current_gen,
-                    "current_pcie_width": pcie_current_width,
-                    "total_memory_gb": round(total_mem, 2),
-                    "compute_capability": "N/A",
-                    "source": "hy-smi",
-                })
-        except Exception as e:
-            log_warn("Device info parsing failed: {}", e)
-        
+            # PCIe info
+            # pcie_gen = pcie_width = pcie_current_gen = pcie_current_width = "N/A"
+            # if pci_bus_id:
+            #     try:
+            #         pcie = self._query_pcie_link_info_from_lspci(pci_bus_id)
+            #         pcie_gen = self.get_pcie_gen(pcie.get("max_speed"))
+            #         pcie_width = pcie.get("max_width", "N/A")
+            #         pcie_current_gen = self.get_pcie_gen(pcie.get("cur_speed"))
+            #         pcie_current_width = pcie.get("cur_width", "N/A")
+            #     except Exception as e:
+            #         log_warn("PCIe info query failed for GPU{}: {}", i, e)
+            # PCIe info (from sysfs)
+            pcie_gen = pcie_width = pcie_current_gen = pcie_current_width = "N/A"
+            if pci_bus_id:
+                try:
+                    pcie = self._query_pcie_link_info_from_sysfs(pci_bus_id)
+
+                    pcie_gen = self.get_pcie_gen(pcie.get("max_speed"))
+                    pcie_width = pcie.get("max_width") or "N/A"
+
+                    pcie_current_gen = self.get_pcie_gen(pcie.get("cur_speed"))
+                    pcie_current_width = pcie.get("cur_width") or "N/A"
+                except Exception as e:
+                    log_warn("PCIe sysfs query failed for GPU{}: {}", i, e)
+
+            name = f"{card_series} ({card_vendor})" if card_vendor != "N/A" else card_series
+
+            meta.append({
+                "index": i,
+                "name": name,
+                "pci_bus_id": pci_bus_id,
+                "pci_domain": pci_domain,
+                "pci_bus": pci_bus,
+                "pci_device": pci_device,
+                "max_pcie_gen": pcie_gen,
+                "max_pcie_width": pcie_width,
+                "current_pcie_gen": pcie_current_gen,
+                "current_pcie_width": pcie_current_width,
+                "total_memory_gb": round(total_mem, 2),
+                "compute_capability": "N/A",
+                "source": "hy-smi",
+            })
+
         return meta
 
     def _parse_mthreads_gmi_for_device_info(self, num_gpus: int, smi: str) -> List[dict[str, Any]]:
         """
-        Parse `mthreads-gmi --query` output and return metadata dicts whose keys
-        fully match NVIDIA path in this project.
+        Moore Threads (MUSA) device metadata parser.
+        Output schema keys must match the NVIDIA path.
         """
-        meta: List[dict[str, Any]] = []
         smi_basename = os.path.basename(smi)
 
         proc = subprocess.run(
@@ -749,89 +812,55 @@ class GpuProfiler:
         )
         if proc.returncode != 0:
             log_warn("{} --query failed: {}", smi, proc.stderr)
-            return meta
+            return []
 
-        text = proc.stdout
-        lines = text.splitlines()
+        lines = proc.stdout.splitlines()
+        header_re = re.compile(r"^GPU(\d+)\s+([0-9a-fA-F:]+\.[0-9])\s*$")
 
-        # State per GPU block
-        cur_idx: int | None = None
+        def _new_meta_entry(idx: int, bdf: str) -> dict[str, Any]:
+            pci_domain = pci_bus = pci_device = "N/A"
+            try:
+                dom_s, bus_s, rest = bdf.split(":")
+                dev_s, _fn = rest.split(".")
+                pci_domain = int(dom_s, 16)
+                pci_bus = int(bus_s, 16)
+                pci_device = int(dev_s, 16)
+            except Exception:
+                pass
+
+            return {
+                "index": idx,
+                "name": "N/A",
+                "pci_bus_id": bdf,
+                "pci_domain": pci_domain,
+                "pci_bus": pci_bus,
+                "pci_device": pci_device,
+                "max_pcie_gen": "N/A",
+                "max_pcie_width": "N/A",
+                "current_pcie_gen": "N/A",
+                "current_pcie_width": "N/A",
+                "total_memory_gb": "N/A",
+                "compute_capability": "N/A",
+                "source": smi_basename,
+            }
+
+        meta_list: List[dict[str, Any]] = []
         cur: dict[str, Any] | None = None
 
-        # Helper to finalize one GPU entry
-        def _flush():
-            nonlocal cur_idx, cur
-            if cur is None:
-                return
-            meta.append(cur)
-            cur_idx = None
-            cur = None
-
-        # Small helpers
-        def _parse_pci(pci_bus_id: str):
-            # Examples:
-            #   00000000:2a:00.0
-            #   0002:05:00.0
-            try:
-                if pci_bus_id.count(":") == 2:
-                    dom_s, bus_s, rest = pci_bus_id.split(":")
-                else:
-                    # If missing domain, treat as N/A
-                    return ("N/A", "N/A", "N/A")
-                dev_s, _fn = rest.split(".")
-                return (int(dom_s, 16), int(bus_s, 16), int(dev_s, 16))
-            except Exception:
-                return ("N/A", "N/A", "N/A")
-
-        def _int_x(val: str) -> Any:
-            # "16x" -> 16
-            try:
-                return int(val.strip().lower().rstrip("x"))
-            except Exception:
-                return "N/A"
-
-        def _int(val: str) -> Any:
-            try:
-                return int(val.strip())
-            except Exception:
-                return "N/A"
-
-        def _float(val: str) -> float | None:
-            try:
-                return float(val.strip())
-            except Exception:
-                return None
-
-        # Parse line-by-line
         i = 0
         while i < len(lines):
-            line = lines[i].rstrip()
+            line = lines[i].strip()
 
-            # Start of GPU block:
-            # "GPU0 00000000:2a:00.0"
-            m = re.match(r"^GPU(\d+)\s+([0-9a-fA-F:]+\.[0-9])\s*$", line.strip())
+            m = header_re.match(line)
             if m:
-                _flush()
-                cur_idx = int(m.group(1))
-                pci_bus_id = m.group(2)
+                # flush previous
+                if cur is not None:
+                    self._supplement_pcie_fields_from_lspci(cur)
+                    meta_list.append(cur)
 
-                pci_domain, pci_bus, pci_device = _parse_pci(pci_bus_id)
-
-                cur = {
-                    "index": cur_idx,
-                    "name": "N/A",
-                    "pci_bus_id": pci_bus_id,
-                    "pci_domain": pci_domain,
-                    "pci_bus": pci_bus,
-                    "pci_device": pci_device,
-                    "max_pcie_gen": "N/A",
-                    "max_pcie_width": "N/A",
-                    "current_pcie_gen": "N/A",
-                    "current_pcie_width": "N/A",
-                    "total_memory_gb": "N/A",
-                    "compute_capability": "N/A",
-                    "source": smi_basename,
-                }
+                idx = int(m.group(1))
+                bdf = m.group(2)
+                cur = _new_meta_entry(idx, bdf)
                 i += 1
                 continue
 
@@ -839,63 +868,54 @@ class GpuProfiler:
                 i += 1
                 continue
 
-            # Key lines in `mthreads-gmi --query` block
-            # "Product Name : MTT S5000"
+            # Product Name : ...
             if "Product Name" in line and ":" in line:
                 cur["name"] = line.split(":", 1)[1].strip()
                 i += 1
                 continue
 
-            # PCIe Generation Max/Current (under GPU Link Info)
-            # "Max : 5" / "Current : 5"
-            if re.search(r"\bPCIe Generation\b", line):
-                # The next few lines contain Max/Current
-                # We just scan forward a small window
-                for j in range(i + 1, min(i + 8, len(lines))):
-                    lj = lines[j].strip()
-                    if lj.startswith("Max") and ":" in lj:
-                        cur["max_pcie_gen"] = _int(lj.split(":", 1)[1])
-                    elif lj.startswith("Current") and ":" in lj:
-                        cur["current_pcie_gen"] = _int(lj.split(":", 1)[1])
+            # FB Memory Usage -> Total : XXXXMiB
+            if line.startswith("Total") and ":" in line and "MiB" in line and cur.get("total_memory_gb") == "N/A":
+                val = line.split(":", 1)[1].strip()
+                m2 = re.match(r"^([0-9.]+)\s*MiB$", val, re.IGNORECASE)
+                if m2:
+                    try:
+                        mib = float(m2.group(1))
+                        cur["total_memory_gb"] = round(mib / 1024.0, 2)
+                    except Exception:
+                        pass
                 i += 1
                 continue
 
-            # Link Width Max/Current: "16x"
-            if re.search(r"\bLink Width\b", line) or re.search(r"\bPcie Lane Width\b", line):
+            # Optional: if mthreads-gmi provides PCIe info, we can prefill; final truth comes from lspci.
+            if re.search(r"\bPCIe Generation\b", line, re.IGNORECASE):
                 for j in range(i + 1, min(i + 8, len(lines))):
                     lj = lines[j].strip()
                     if lj.startswith("Max") and ":" in lj:
-                        cur["max_pcie_width"] = _int_x(lj.split(":", 1)[1])
+                        cur["max_pcie_gen"] = lj.split(":", 1)[1].strip() or cur["max_pcie_gen"]
                     elif lj.startswith("Current") and ":" in lj:
-                        cur["current_pcie_width"] = _int_x(lj.split(":", 1)[1])
+                        cur["current_pcie_gen"] = lj.split(":", 1)[1].strip() or cur["current_pcie_gen"]
                 i += 1
                 continue
 
-            # Memory total: under "FB Memory Usage" -> "Total : 81920MiB"
-            if re.search(r"\bFB Memory Usage\b", line):
-                # scan next window
-                for j in range(i + 1, min(i + 20, len(lines))):
+            if re.search(r"\bLink Width\b", line, re.IGNORECASE) or re.search(r"\bPcie Lane Width\b", line, re.IGNORECASE):
+                for j in range(i + 1, min(i + 8, len(lines))):
                     lj = lines[j].strip()
-                    if lj.startswith("Total") and ":" in lj:
-                        val = lj.split(":", 1)[1].strip()
-                        # "81920MiB"
-                        m2 = re.match(r"^([0-9.]+)\s*MiB$", val, re.IGNORECASE)
-                        if m2:
-                            mib = _float(m2.group(1))
-                            if mib is not None:
-                                cur["total_memory_gb"] = round(mib / 1024.0, 2)
-                        break
+                    if lj.startswith("Max") and ":" in lj:
+                        cur["max_pcie_width"] = lj.split(":", 1)[1].strip() or cur["max_pcie_width"]
+                    elif lj.startswith("Current") and ":" in lj:
+                        cur["current_pcie_width"] = lj.split(":", 1)[1].strip() or cur["current_pcie_width"]
                 i += 1
                 continue
 
             i += 1
 
-        _flush()
+        if cur is not None:
+            self._supplement_pcie_fields_from_lspci(cur)
+            meta_list.append(cur)
 
-        # Ensure we return in index order and at most num_gpus entries
-        meta.sort(key=lambda d: d.get("index", 0))
-        return meta[:num_gpus]
-
+        meta_list.sort(key=lambda d: d.get("index", 0))
+        return meta_list[:num_gpus]
     def _parse_smi_for_device_info(self, num_gpus: int) -> List[dict[str, Any]]:
         """Parse the SMI command to obtain device information"""
         meta: List[dict[str, Any]] = []
@@ -1564,3 +1584,4 @@ class GpuProfiler:
             lat_pageable_h2d, lat_pageable_d2h,
             lat_pinned_h2d,   lat_pinned_d2h,
         )
+
