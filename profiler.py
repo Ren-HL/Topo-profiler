@@ -485,7 +485,22 @@ class GpuProfiler:
 
         # Guaranteed to return results sorted by index.
         for d in gpu_basic.values():
-            self._supplement_pcie_fields_from_lspci(d)
+            pci_bus_id = d.get("pci_bus_id")
+            pcie_gen = pcie_width = pcie_current_gen = pcie_current_width = "N/A"
+            if isinstance(pci_bus_id, str) and pci_bus_id not in ("", "N/A"):
+                try:
+                    pcie = self._query_pcie_link_info_from_sysfs(pci_bus_id)
+                    pcie_gen = self.get_pcie_gen(pcie.get("max_speed"))
+                    pcie_width = pcie.get("max_width") or "N/A"
+                    pcie_current_gen = self.get_pcie_gen(pcie.get("cur_speed"))
+                    pcie_current_width = pcie.get("cur_width") or "N/A"
+                except Exception as e:
+                    log_warn("PCIe sysfs query failed: {}", e)
+
+            d["max_pcie_gen"] = pcie_gen
+            d["max_pcie_width"] = pcie_width
+            d["current_pcie_gen"] = pcie_current_gen
+            d["current_pcie_width"] = pcie_current_width
         return [gpu_basic[i] for i in sorted(gpu_basic)]
     
 
@@ -520,92 +535,6 @@ class GpuProfiler:
             if abs(gt - k) < 1e-6:
                 return v
         return "N/A"
-
-    def _query_pcie_link_info_from_lspci(self, pci_bus_id: str) -> Dict[str, Optional[str]]:
-        """
-        Query PCIe link capability/status from `lspci -vv -s <pci_bus_id>`.
-
-        Returns:
-            {
-            "max_speed": "16" or "16.0" or None,
-            "max_width": "16" or None,
-            "cur_speed": "8" or "8.0" or None,
-            "cur_width": "8" or None,
-            }
-        """
-        max_speed = max_width = cur_speed = cur_width = None
-
-        lspci_proc = subprocess.run(
-            ["sudo","lspci", "-vv", "-s", pci_bus_id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if lspci_proc.returncode != 0:
-            raise RuntimeError(f"lspci -vv -s query failed: {lspci_proc.stderr.strip()}")
-
-        genlines = [ln.strip() for ln in lspci_proc.stdout.splitlines() if ln.strip()]
-
-        # same regex you used
-        speed_re = re.compile(r"Speed\s+([0-9]+(?:\.[0-9]+)?)GT/s")
-        width_re = re.compile(r"Width\s+x(\d+)")
-
-        for genline in genlines:
-            if "LnkCap:" in genline and "Speed" in genline and "Width" in genline:
-                ms = speed_re.search(genline)
-                mw = width_re.search(genline)
-                if ms:
-                    max_speed = ms.group(1)  # "16" / "16.0"
-                if mw:
-                    max_width = mw.group(1)  # "16"
-            elif "LnkSta" in genline and "Speed" in genline and "Width" in genline:
-                cs = speed_re.search(genline)
-                cw = width_re.search(genline)
-                if cs:
-                    cur_speed = cs.group(1)
-                if cw:
-                    cur_width = cw.group(1)
-
-        return {
-            "max_speed": max_speed,
-            "max_width": max_width,
-            "cur_speed": cur_speed,
-            "cur_width": cur_width,
-        }
-
-    def _supplement_pcie_fields_from_lspci(self, meta: Dict[str, Any]) -> None:
-        """
-        Shared PCIe supplement for MetaX / Hygon / Moore.
-
-        It fills/overrides the following fields in the project-wide schema:
-        - max_pcie_gen / max_pcie_width
-        - current_pcie_gen / current_pcie_width
-
-        It never raises; on failure it leaves existing values unchanged.
-        """
-        pci_bus_id = meta.get("pci_bus_id")
-        if not isinstance(pci_bus_id, str) or pci_bus_id in ("", "N/A"):
-            return
-
-        try:
-            pcie = self._query_pcie_link_info_from_lspci(pci_bus_id)
-            max_speed = pcie.get("max_speed")
-            max_width = pcie.get("max_width")
-            cur_speed = pcie.get("cur_speed")
-            cur_width = pcie.get("cur_width")
-        except Exception as e:
-            log_warn("Device PCIe info parsing failed: {}", e)
-            return
-
-        # Only override if lspci provides meaningful values
-        if max_speed:
-            meta["max_pcie_gen"] = self.get_pcie_gen(max_speed)
-        if max_width:
-            meta["max_pcie_width"] = max_width
-        if cur_speed:
-            meta["current_pcie_gen"] = self.get_pcie_gen(cur_speed)
-        if cur_width:
-            meta["current_pcie_width"] = cur_width
 
     def _query_pcie_link_info_from_sysfs(self, pci_bus_id: str) -> dict:
         """
@@ -855,7 +784,16 @@ class GpuProfiler:
             if m:
                 # flush previous
                 if cur is not None:
-                    self._supplement_pcie_fields_from_lspci(cur)
+                    pci_bus_id = cur.get("pci_bus_id")
+                    if isinstance(pci_bus_id, str) and pci_bus_id not in ("", "N/A"):
+                        try:
+                            pcie = self._query_pcie_link_info_from_sysfs(pci_bus_id)
+                            cur["max_pcie_gen"] = self.get_pcie_gen(pcie.get("max_speed"))
+                            cur["max_pcie_width"] = pcie.get("max_width") or cur["max_pcie_width"]
+                            cur["current_pcie_gen"] = self.get_pcie_gen(pcie.get("cur_speed"))
+                            cur["current_pcie_width"] = pcie.get("cur_width") or cur["current_pcie_width"]
+                        except Exception as e:
+                            log_warn("PCIe sysfs query failed for GPU{}: {}", cur.get("index"), e)
                     meta_list.append(cur)
 
                 idx = int(m.group(1))
@@ -911,7 +849,16 @@ class GpuProfiler:
             i += 1
 
         if cur is not None:
-            self._supplement_pcie_fields_from_lspci(cur)
+            pci_bus_id = cur.get("pci_bus_id")
+            if isinstance(pci_bus_id, str) and pci_bus_id not in ("", "N/A"):
+                try:
+                    pcie = self._query_pcie_link_info_from_sysfs(pci_bus_id)
+                    cur["max_pcie_gen"] = self.get_pcie_gen(pcie.get("max_speed"))
+                    cur["max_pcie_width"] = pcie.get("max_width") or cur["max_pcie_width"]
+                    cur["current_pcie_gen"] = self.get_pcie_gen(pcie.get("cur_speed"))
+                    cur["current_pcie_width"] = pcie.get("cur_width") or cur["current_pcie_width"]
+                except Exception as e:
+                    log_warn("PCIe sysfs query failed for GPU{}: {}", cur.get("index"), e)
             meta_list.append(cur)
 
         meta_list.sort(key=lambda d: d.get("index", 0))
@@ -1584,4 +1531,3 @@ class GpuProfiler:
             lat_pageable_h2d, lat_pageable_d2h,
             lat_pinned_h2d,   lat_pinned_d2h,
         )
-
